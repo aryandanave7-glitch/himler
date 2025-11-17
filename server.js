@@ -569,9 +569,26 @@ app.post("/relay-message", async (req, res) => {
         };
 
         const insertResult = await offlineMessagesCollection.insertOne(messageDoc);
+        const newMsgId = insertResult.insertedId.toString();
 
-        console.log(`📦 Relayed message stored: ${insertResult.insertedId} from ${senderPubKey.slice(0,10)}... to ${recipientPubKey.slice(0,10)}...`);
-        res.status(201).json({ success: true, messageId: insertResult.insertedId.toString(), size: payloadSizeBytes });
+        console.log(`📦 Relayed message stored: ${newMsgId} from ${senderPubKey.slice(0,10)}... to ${recipientPubKey.slice(0,10)}...`);
+
+        // --- THIS IS THE NEW "LIVE" PUSH LOGIC ---
+        // 4. Check if recipient is online
+        const targetSocketId = userSockets[recipientPubKey];
+        if (targetSocketId) {
+            log(`... Recipient ${recipientPubKey.slice(0,10)} is ONLINE. Pushing message live...`);
+            // Emit the exact same event that the "pull" request uses
+            io.to(targetSocketId).emit("offline-message", {
+                id: newMsgId,
+                from: senderPubKey,
+                payload: encryptedPayload,
+                sentAt: messageDoc.createdAt
+            });
+        }
+        // --- END NEW LOGIC ---
+
+        res.status(201).json({ success: true, messageId: newMsgId, size: payloadSizeBytes });
 
     } catch (err) {
         console.error("relay-message error:", err);
