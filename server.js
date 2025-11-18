@@ -1641,22 +1641,23 @@ app.post("/channels/set-storage-mode", async (req, res) => {
  * The client is responsible for encrypting and distributing the GroupKey.
  */
 app.post("/group/create", async (req, res) => {
-    const { groupName, groupAvatar, members, ownerPubKey, signature } = req.body;
+    // Accept groupDescription from body
+    const { groupName, groupDescription, groupAvatar, members, ownerPubKey, signature } = req.body;
 
     if (!groupName || !Array.isArray(members) || members.length === 0 || !ownerPubKey || !signature) {
         return res.status(400).json({ error: "Missing required fields (groupName, members, ownerPubKey, signature)." });
     }
 
-    // Verify the signature (owner signed the groupName + all member PubKeys sorted)
+    // Verify the signature: groupName + (description or empty) + members + owner
     const membersString = [...members].sort().join(',');
-    const dataToVerify = `${groupName}${membersString}${ownerPubKey}`;
+    const descStr = groupDescription || ""; // Handle empty description
+    const dataToVerify = `${groupName}${descStr}${membersString}${ownerPubKey}`;
 
     const isOwner = await verifySignature(ownerPubKey, signature, dataToVerify);
     if (!isOwner) {
         return res.status(403).json({ error: "Invalid signature. Cannot create group." });
     }
 
-    // Ensure the owner is also in the member list
     if (!members.includes(ownerPubKey)) {
         members.push(ownerPubKey);
     }
@@ -1664,10 +1665,11 @@ app.post("/group/create", async (req, res) => {
     try {
         const newGroup = {
             groupName: groupName,
+            description: groupDescription || "", // Store description
             groupAvatar: groupAvatar || null,
             owner: ownerPubKey,
-            admins: [ownerPubKey], // Owner is the first admin
-            members: members,     // Full member list
+            admins: [ownerPubKey],
+            members: members,
             createdAt: new Date()
         };
 
@@ -1727,27 +1729,37 @@ app.post("/group/meta", async (req, res) => {
  * Only an admin can do this.
  */
 app.post("/group/update-meta", async (req, res) => {
-    const { groupID, pubKey, signature, newName, newAvatar } = req.body;
+    const { groupID, pubKey, signature, newName, newAvatar, newDescription } = req.body;
+    
     if (!groupID || !pubKey || !signature) {
         return res.status(400).json({ error: "Missing required fields." });
     }
-    if (newName === undefined && newAvatar === undefined) {
-        return res.status(400).json({ error: "Must provide newName or newAvatar." });
+    // Ensure at least one field is being updated
+    if (newName === undefined && newAvatar === undefined && newDescription === undefined) {
+        return res.status(400).json({ error: "Must provide newName, newAvatar, or newDescription." });
     }
 
     try {
-        // 1. Find group
         const group = await groupsCollection.findOne({ _id: new ObjectId(groupID) });
         if (!group) return res.status(404).json({ error: "Group not found." });
 
-        // 2. Verify user is an admin
         if (!group.admins.includes(pubKey)) {
             return res.status(403).json({ error: "You are not an admin of this group." });
         }
 
-        // 3. Verify signature (admin signed the groupID + newName)
-        // Note: We don't sign the avatar as it's too large.
-        const dataToVerify = `${groupID}${newName || group.groupName}`;
+        // 3. Verify signature
+        // LOGIC: If updating Name, sign ID+Name. If updating Description, sign ID+Description.
+        // If updating Avatar only, sign ID+CurrentName (fallback).
+        let dataToVerify = "";
+        if (newName !== undefined) {
+            dataToVerify = `${groupID}${newName}`;
+        } else if (newDescription !== undefined) {
+            dataToVerify = `${groupID}${newDescription}`;
+        } else {
+            // Fallback for avatar-only updates
+            dataToVerify = `${groupID}${group.groupName}`; 
+        }
+
         const isAuthentic = await verifySignature(pubKey, signature, dataToVerify);
         if (!isAuthentic) {
             return res.status(403).json({ error: "Invalid signature." });
@@ -1756,7 +1768,8 @@ app.post("/group/update-meta", async (req, res) => {
         // 4. Build update
         const fieldsToUpdate = {};
         if (newName !== undefined) fieldsToUpdate.groupName = newName;
-        if (newAvatar !== undefined) fieldsToUpdate.groupAvatar = newAvatar; // Can be null
+        if (newDescription !== undefined) fieldsToUpdate.description = newDescription;
+        if (newAvatar !== undefined) fieldsToUpdate.groupAvatar = newAvatar;
 
         // 5. Perform update
         await groupsCollection.updateOne({ _id: group._id }, { $set: fieldsToUpdate });
