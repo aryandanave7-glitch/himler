@@ -48,6 +48,7 @@ let groupsCollection; // For group metadata
 let groupOfflineMessagesCollection; // For offline group messages
 let channelsCollection; // For channel info
 let channelUpdatesCollection; // For channel messages
+let accessLogsCollection;
 
 async function connectToMongo() {
   try {
@@ -254,73 +255,65 @@ app.use(cors());       // CORS Middleware
 // Endpoint to claim a new Syrja ID
 // Endpoint to claim a new Syrja ID (MODIFIED for MongoDB)
 app.post("/claim-id", async (req, res) => {
-    const { customId, fullInviteCode, persistence, privacy, pubKey } = req.body; // Added privacy
+    // --- NEW: Accept 'regenerate' flag ---
+    const { customId, fullInviteCode, persistence, privacy, pubKey, regenerate } = req.body; 
 
-    // Added privacy check in condition
     if (!customId || !fullInviteCode || !persistence || !privacy || !pubKey) {
         return res.status(400).json({ error: "Missing required fields" });
     }
 
     try {
-        // Check if this public key already owns a DIFFERENT ID using MongoDB findOne
+        // Check ownership... (Keep existing ownership checks)
         const existingUserEntry = await idsCollection.findOne({ pubKey: pubKey });
-        // Use _id from MongoDB document
         if (existingUserEntry && existingUserEntry._id !== customId) {
-            return res.status(409).json({ error: "You already own a different ID. Please delete it before claiming a new one." });
+            return res.status(409).json({ error: "You already own a different ID." });
         }
-
-        // Check if the requested ID is taken by someone else using MongoDB findOne
         const existingIdEntry = await idsCollection.findOne({ _id: customId });
         if (existingIdEntry && existingIdEntry.pubKey !== pubKey) {
             return res.status(409).json({ error: "ID already taken" });
         }
 
-        // Decode the invite code to extract profile details
+        // Decode Profile... (Keep existing decode logic)
         let decodedProfile;
-        let statusText = null; // Default to null
+        let statusText = null; 
         let updateText = null;
         let updateColor = null;
+        let ecdhPubKey = null;
+
         try {
             decodedProfile = JSON.parse(Buffer.from(fullInviteCode, 'base64').toString('utf8'));
-            statusText = decodedProfile.statusText || null; // Extract status text, default to null if missing
+            statusText = decodedProfile.statusText || null;
             updateText = decodedProfile.updateText || null;
             updateColor = decodedProfile.updateColor || null;
-            ecdhPubKey = decodedProfile.ecdhPubKey || null; // <-- NEW
-            console.log(`[Claim/Update ID: ${customId}] Decoded Profile - Status Text: '${statusText}'`);
-            
-        } catch (e) {
-            console.error(`[Claim/Update ID: ${customId}] Failed to decode fullInviteCode:`, e);
-            // Decide how to handle this - maybe reject the request or proceed without status?
-            // For now, we'll proceed with statusText as null.
-        }
-        const existingDoc = await idsCollection.findOne({ _id: customId });
+            ecdhPubKey = decodedProfile.ecdhPubKey || null;
+        } catch (e) {}
 
-        // 2. Determine Security Settings
+        // --- NEW LOGIC: Determine Passcode ---
         let verificationPasscode;
-        let privacyMode;
-
-        if (existingDoc) {
-            // PRESERVE existing code and privacy unless client explicitly sends new privacy
-            verificationPasscode = existingDoc.verificationPasscode || generatePasscode();
-            privacyMode = privacy || existingDoc.privacy || 'restricted';
-        } else {
-            // NEW ID: Generate code and force default to Restricted
+        
+        if (regenerate) {
+            // Force new code if requested
             verificationPasscode = generatePasscode();
-            privacyMode = privacy || 'restricted'; // Default to restricted for safety
+        } else if (existingIdEntry && existingIdEntry.verificationPasscode) {
+            // Keep existing if available
+            verificationPasscode = existingIdEntry.verificationPasscode;
+        } else {
+            // Generate new if missing
+            verificationPasscode = generatePasscode();
         }
+        // -------------------------------------
 
-        // Prepare the document to insert/update
         const syrjaDoc = {
             _id: customId,
             code: fullInviteCode,
             pubKey: pubKey,
             permanent: persistence === 'permanent',
+            privacy: privacy,
             
-            // --- NEW SECURITY FIELDS ---
-            privacy: privacyMode,
+            // --- NEW: Save Passcode ---
             verificationPasscode: verificationPasscode,
-            // ---------------------------
-
+            // --------------------------
+            
             updatedAt: new Date(),
             name: decodedProfile?.name || null,
             avatar: decodedProfile?.avatar || null,
@@ -330,37 +323,27 @@ app.post("/claim-id", async (req, res) => {
             updateColor: updateColor,
             updateTimestamp: updateText ? new Date() : null 
         };
-        // Prepare the document to insert/update for MongoDB
-        
 
-        // Set expiration only for temporary IDs
         if (persistence === 'temporary') {
             syrjaDoc.expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
-        } else {
-            // Ensure expireAt field is absent or explicitly null for permanent IDs
-            // $unset below handles removal if it exists, so no need to set null here if updating.
         }
 
-        // Use replaceOne with upsert:true to insert or replace the document
-        await idsCollection.replaceOne(
-            { _id: customId },
-            syrjaDoc,
-            { upsert: true }
-        );
+        await idsCollection.replaceOne({ _id: customId }, syrjaDoc, { upsert: true });
 
-        // If making permanent or updating a permanent record, ensure expireAt field is removed
         if (persistence === 'permanent') {
              await idsCollection.updateOne({ _id: customId }, { $unset: { expireAt: "" } });
         }
-        // Updated console log
-        console.log(`✅ ID Claimed/Updated: ${customId} (Permanent: ${syrjaDoc.permanent}, Privacy: ${privacy})`);
-        res.json({ success: true, id: customId });
 
+        console.log(`✅ ID Claimed/Updated: ${customId} (Privacy: ${privacy})`);
+        
+        // --- NEW: Return the code to the client ---
+        res.json({ success: true, id: customId, verificationPasscode: verificationPasscode });
     } catch (err) {
         console.error("claim-id error:", err);
         res.status(500).json({ error: "Database operation failed" });
     }
 });
+
 // Endpoint to get an invite code from a Syrja ID (for adding contacts)
 // Endpoint to get an invite code from a Syrja ID (MODIFIED for MongoDB)
 // Endpoint to get an invite code from a Syrja ID (MODIFIED for MongoDB + Block Check)
@@ -468,25 +451,27 @@ app.get("/get-invite/:id", async (req, res) => {
 });
 
 // Endpoint to find a user's current ID by their public key
-// Endpoint to find a user's current ID by their public key (MODIFIED for MongoDB)
+// Endpoint to find a user's current ID by their public key
 app.get("/get-id-by-pubkey/:pubkey", async (req, res) => {
     const pubkey = req.params.pubkey;
     try {
-        // Use findOne to search by the pubKey field
         const item = await idsCollection.findOne({ pubKey: pubkey });
 
         if (item) {
-            // Found a match, return the document's _id and other details
             console.log(`🔎 Found ID for pubkey ${pubkey.slice(0,12)}... -> ${item._id}`);
-            // Include privacy in the response
-            res.json({ id: item._id, permanent: item.permanent, privacy: item.privacy });
+            // --- NEW: Return Privacy & Passcode ---
+            res.json({ 
+                id: item._id, 
+                permanent: item.permanent, 
+                privacy: item.privacy || 'restricted',
+                verificationPasscode: item.verificationPasscode 
+            });
+            // -------------------------------------
         } else {
-            // No document found matching the public key
             console.log(`🔎 No ID found for pubkey ${pubkey.slice(0,12)}...`);
             res.status(404).json({ error: "No ID found for this public key" });
         }
     } catch (err) {
-        // Handle potential database errors
         console.error("get-id-by-pubkey error:", err);
         res.status(500).json({ error: "Database operation failed" });
     }
