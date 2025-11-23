@@ -262,6 +262,14 @@ app.post("/claim-id", async (req, res) => {
         return res.status(400).json({ error: "Missing required fields" });
     }
 
+    // --- SECURITY FIX: Validate ID Format (No @ allowed) ---
+    const idPart = customId.replace('syrja/', '');
+    // Allow A-Z, 0-9, underscore, dash. BLOCK everything else.
+    if (!/^[a-zA-Z0-9_-]+$/.test(idPart)) {
+        return res.status(400).json({ error: "ID contains invalid characters. Use only letters, numbers, - or _." });
+    }
+    // ------------------------------------------------------
+
     try {
         // Check ownership... (Keep existing ownership checks)
         const existingUserEntry = await idsCollection.findOne({ pubKey: pubKey });
@@ -382,26 +390,45 @@ app.get("/get-invite/:id", async (req, res) => {
         }
 
         // --- 4. PRIVACY LOGIC ---
-        const mode = item.privacy || 'restricted'; // Default to restricted if undefined
+        const mode = item.privacy || 'restricted'; 
 
-        // CASE A: LOCKED (Private)
+        // CASE A: LOCKED (Private) - Always hide
         if (mode === 'private' || mode === 'locked') {
-            console.log(`🔒 HIDDEN: ${fullId} is Locked/Private.`);
-            return res.status(404).json({ error: "ID not found" }); // Hide existence
+            return res.status(404).json({ error: "ID not found" });
         }
 
-        // CASE B: RESTRICTED (Friend Code Required)
-        if (mode === 'restricted') {
-            // 1. Check if code was provided
-            if (!providedPasscode) {
-                console.log(`🛡️ PROTECTED: ${fullId} requires passcode.`);
-                // Return special 401 so client knows to show Input Field
-                return res.status(401).json({ 
-                    error: "Passcode required", 
-                    status: "requires_passcode",
-                    previewName: item.name // Optional: Show name to confirm it's the right person
-                });
+        // --- NEW: UNIVERSAL PASSCODE CHECK ---
+        // If the user PROVIDED a passcode (via @code syntax), we MUST verify it,
+        // even if the profile is 'public'.
+        if (providedPasscode) {
+            if (providedPasscode.toUpperCase() !== (item.verificationPasscode || "").toUpperCase()) {
+                console.log(`❌ FAILED: ${fullId} - Wrong code provided (Strict Mode)`);
+                
+                // Log failure (Rate Limiting)
+                await accessLogsCollection.updateOne(
+                    { _id: logKey },
+                    { $inc: { count: 1 }, $set: { lastAttempt: new Date() } },
+                    { upsert: true }
+                );
+                
+                return res.status(403).json({ error: "Incorrect Friend Code." });
             }
+            // If match, we proceed to success (Access Log clears below)
+        }
+        
+        // CASE B: RESTRICTED (If NO code provided)
+        else if (mode === 'restricted') {
+             console.log(`🛡️ PROTECTED: ${fullId} requires passcode.`);
+             return res.status(401).json({ 
+                error: "Passcode required", 
+                status: "requires_passcode",
+                previewName: item.name 
+             });
+        }
+        
+        // CASE C: PUBLIC (No code provided) -> Allow access
+        
+        // ... (Success Logic: Clear logs, return payload) ...
 
             // 2. Verify Code (Case-insensitive)
             if (providedPasscode.toUpperCase() !== (item.verificationPasscode || "").toUpperCase()) {
