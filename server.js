@@ -464,7 +464,7 @@ app.get("/get-id-by-pubkey/:pubkey", async (req, res) => {
                 id: item._id, 
                 permanent: item.permanent, 
                 privacy: item.privacy || 'restricted',
-                verificationPasscode: item.verificationPasscode 
+                
             });
             // -------------------------------------
         } else {
