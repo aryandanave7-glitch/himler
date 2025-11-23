@@ -685,6 +685,45 @@ app.post("/relay-message", async (req, res) => {
     }
 });
 
+// --- MUTUAL VERIFICATION QUEUE ---
+
+// 1. Queue a Mutual Check (Ping/Pong/Unping)
+app.post('/queue-mutual-check', async (req, res) => {
+    const { targetPubKey, encryptedBlob } = req.body;
+    
+    if (!targetPubKey || !encryptedBlob) return res.status(400).json({ error: "Missing fields" });
+
+    try {
+        // Store in a separate collection acting as a mailbox
+        await db.collection('pending_mutual_checks').insertOne({
+            recipient: targetPubKey,
+            blob: encryptedBlob,
+            timestamp: Date.now(),
+            ttl: new Date(Date.now() + 1000 * 60 * 60 * 24 * 7) // Auto-delete after 7 days (handled by MongoDB TTL index if set)
+        });
+        res.json({ success: true });
+    } catch (e) {
+        console.error("Queue mutual check error:", e);
+        res.status(500).json({ error: "Database error" });
+    }
+});
+
+// 2. Set Privacy Access Token (The Gatekeeper Hash)
+app.post('/set-privacy-token', async (req, res) => {
+    const { pubKey, tokenHash, signature } = req.body;
+    // verifySignature(pubKey, tokenHash, signature) <- IMPLEMENT THIS VERIFICATION in prod!
+    
+    try {
+        await db.collection('ids').updateOne(
+            { key: pubKey }, // Assuming 'key' stores the PubKey in your profile DB
+            { $set: { privacyAccessHash: tokenHash } }
+        );
+        res.json({ success: true });
+    } catch(e) {
+        res.status(500).json({ error: "Update failed" });
+    }
+});
+
 // Endpoint for sender to view their relayed messages and quota
 app.get("/my-relayed-messages/:senderPubKey", async (req, res) => {
     const { senderPubKey } = req.params;
@@ -2149,7 +2188,16 @@ io.on("connection", (socket) => {
     console.log(`🔑 Registered: ${key.slice(0,12)}... -> ${socket.id}`);
 
     socket.emit('registered', { status: 'ok' });
-    
+
+    const pendingChecks = await db.collection('pending_mutual_checks').find({ recipient: pubKey }).toArray();
+   
+    if (pendingChecks.length > 0) {
+       const blobs = pendingChecks.map(c => c.blob);
+       socket.emit('mutual-sync-batch', blobs);
+       
+       // DELETE immediately (Courier model)
+       await db.collection('pending_mutual_checks').deleteMany({ recipient: pubKey });
+   }
   // --- Notify subscribers that this user is now online ---
     const subscribers = presenceSubscriptions[key];
     if (subscribers && subscribers.length) {
