@@ -685,31 +685,44 @@ app.post("/relay-message", async (req, res) => {
     }
 });
 
-// Endpoint for sender to view their relayed messages and quota
+// Endpoint for sender to view unified storage (Direct + Group)
 app.get("/my-relayed-messages/:senderPubKey", async (req, res) => {
     const { senderPubKey } = req.params;
     if (!senderPubKey) return res.status(400).json({ error: "Missing sender public key." });
 
     try {
-        const messages = await offlineMessagesCollection.find(
+        // 1. Fetch Direct Messages
+        const directMsgs = await offlineMessagesCollection.find(
             { senderPubKey },
-            { projection: { _id: 1, recipientPubKey: 1, sizeBytes: 1, createdAt: 1 } } // Only send safe metadata
+            { projection: { _id: 1, recipientPubKey: 1, sizeBytes: 1, createdAt: 1 } }
         ).toArray();
 
-        let currentUsage = 0;
-        messages.forEach(msg => { currentUsage += msg.sizeBytes; });
+        // 2. Fetch Group Messages
+        const groupMsgs = await groupOfflineMessagesCollection.find(
+            { senderPubKey },
+            { projection: { _id: 1, groupID: 1, sizeBytes: 1, createdAt: 1, pendingRecipients: 1 } }
+        ).toArray();
+
+        // 3. Format and Merge
+        const formattedDirect = directMsgs.map(m => ({ ...m, type: 'direct' }));
+        const formattedGroup = groupMsgs.map(m => ({ ...m, type: 'group' }));
+        
+        const allMessages = [...formattedDirect, ...formattedGroup];
+
+        // 4. Calculate Total Usage
+        const currentUsage = allMessages.reduce((sum, m) => sum + (m.sizeBytes || 0), 0);
+        const USER_QUOTA = 50 * 1024 * 1024; // 50MB Unified Quota
 
         res.json({
             quotaUsed: currentUsage,
-            quotaLimit: USER_QUOTA_BYTES,
-            messages: messages
+            quotaLimit: USER_QUOTA,
+            messages: allMessages
         });
     } catch (err) {
         console.error("my-relayed-messages error:", err);
         res.status(500).json({ error: "Database operation failed." });
     }
 });
-
 // Endpoint for sender to delete a message they relayed
 app.delete("/delete-relayed-message/:messageId", async (req, res) => {
     const { messageId } = req.params;
@@ -736,6 +749,35 @@ app.delete("/delete-relayed-message/:messageId", async (req, res) => {
     } catch (err) {
         console.error("delete-relayed-message error:", err);
         res.status(500).json({ error: "Database operation failed or invalid ID." });
+    }
+});
+
+// Endpoint to delete a group message (The "Kill Switch")
+app.delete("/delete-group-relayed-message/:messageId", async (req, res) => {
+    const { messageId } = req.params;
+    const { senderPubKey } = req.body;
+
+    if (!senderPubKey) return res.status(400).json({ error: "Missing auth." });
+
+    try {
+        const { ObjectId } = require("mongodb");
+        const _id = new ObjectId(messageId);
+
+        // Delete the blob entirely, removing it for ALL pending recipients
+        const deleteResult = await groupOfflineMessagesCollection.deleteOne({
+            _id: _id,
+            senderPubKey: senderPubKey // Proof of ownership
+        });
+
+        if (deleteResult.deletedCount === 1) {
+            console.log(`🗑️ Sender ${senderPubKey.slice(0,10)}... killed group message ${messageId}`);
+            res.json({ success: true });
+        } else {
+            res.status(404).json({ error: "Message not found or unauthorized." });
+        }
+    } catch (err) {
+        console.error("delete-group-relayed-message error:", err);
+        res.status(500).json({ error: "Server error." });
     }
 });
 
