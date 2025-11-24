@@ -343,6 +343,26 @@ app.post("/claim-id", async (req, res) => {
         }
 
         console.log(`✅ ID Claimed/Updated: ${customId} (Privacy: ${privacy})`);
+
+        // --- NEW: REAL-TIME NOTIFICATION ---
+        // 1. Normalize the key to match the subscription map
+        const cleanKey = pubKey.replace(/\s+/g, '');
+        
+        // 2. Find everyone watching this user (Friends who are online)
+        const subscribers = presenceSubscriptions[cleanKey];
+        
+        if (subscribers && subscribers.length > 0) {
+            console.log(`📢 Pushing profile update to ${subscribers.length} subscribers...`);
+            
+            // 3. Blast the new data to them
+            subscribers.forEach(socketId => {
+                io.to(socketId).emit('contact-profile-updated', {
+                    pubKey: pubKey,
+                    fullInviteCode: fullInviteCode // Send the new data directly!
+                });
+            });
+        }
+        // --- END NEW ---
         
         // --- NEW: Return the code to the client ---
         res.json({ success: true, id: customId, verificationPasscode: verificationPasscode });
