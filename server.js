@@ -376,6 +376,7 @@ app.post("/claim-id", async (req, res) => {
 // Endpoint to get an invite code from a Syrja ID (MODIFIED for MongoDB)
 // Endpoint to get an invite code from a Syrja ID (MODIFIED for MongoDB + Block Check)
 // Endpoint to get an invite code (Modified for 3-Tier Privacy & Rate Limiting)
+// Endpoint to get an invite code from a Syrja ID (Modified for 3-Tier Privacy & Rate Limiting)
 app.get("/get-invite/:id", async (req, res) => {
     const fullId = `syrja/${req.params.id}`;
     const searcherPubKey = req.query.searcherPubKey;
@@ -388,7 +389,6 @@ app.get("/get-invite/:id", async (req, res) => {
 
     try {
         // --- 1. CHECK RATE LIMIT (Brute Force Protection) ---
-        // We track failures by IP + Target ID
         const logKey = `${clientIp}_${fullId}`;
         const accessLog = await accessLogsCollection.findOne({ _id: logKey });
 
@@ -410,7 +410,7 @@ app.get("/get-invite/:id", async (req, res) => {
         }
 
         // --- 4. PRIVACY LOGIC ---
-        const mode = item.privacy || 'restricted'; 
+        const mode = item.privacy || 'restricted';
 
         // CASE A: LOCKED (Private) - Always hide
         if (mode === 'private' || mode === 'locked') {
@@ -418,64 +418,40 @@ app.get("/get-invite/:id", async (req, res) => {
         }
 
         // --- NEW: UNIVERSAL PASSCODE CHECK ---
-        // If the user PROVIDED a passcode (via @code syntax), we MUST verify it,
-        // even if the profile is 'public'.
         if (providedPasscode) {
+            // Verify Code (Case-insensitive)
             if (providedPasscode.toUpperCase() !== (item.verificationPasscode || "").toUpperCase()) {
                 console.log(`❌ FAILED: ${fullId} - Wrong code provided (Strict Mode)`);
-                
+
                 // Log failure (Rate Limiting)
                 await accessLogsCollection.updateOne(
                     { _id: logKey },
                     { $inc: { count: 1 }, $set: { lastAttempt: new Date() } },
                     { upsert: true }
                 );
-                
+
                 return res.status(403).json({ error: "Incorrect Friend Code." });
             }
-            // If match, we proceed to success (Access Log clears below)
-        }
-        
-        // CASE B: RESTRICTED (If NO code provided)
-        else if (mode === 'restricted') {
-             console.log(`🛡️ PROTECTED: ${fullId} requires passcode.`);
-             return res.status(401).json({ 
-                error: "Passcode required", 
-                status: "requires_passcode",
-                previewName: item.name 
-             });
-        }
-        
-        // CASE C: PUBLIC (No code provided) -> Allow access
-        
-        // ... (Success Logic: Clear logs, return payload) ...
-
-            // 2. Verify Code (Case-insensitive)
-            if (providedPasscode.toUpperCase() !== (item.verificationPasscode || "").toUpperCase()) {
-                console.log(`❌ FAILED: ${fullId} - Wrong code from ${clientIp}`);
-                
-                // Increment Failure Count
-                await accessLogsCollection.updateOne(
-                    { _id: logKey },
-                    { $inc: { count: 1 }, $set: { lastAttempt: new Date() } },
-                    { upsert: true }
-                );
-                
-                return res.status(403).json({ error: "Incorrect passcode." });
-            }
             
-            // 3. Success - Reset Failure Log on successful entry
+            // If match, we proceed to success. Reset Failure Log.
             await accessLogsCollection.deleteOne({ _id: logKey });
         }
+        // CASE B: RESTRICTED (If NO code provided)
+        else if (mode === 'restricted') {
+            console.log(`🛡️ PROTECTED: ${fullId} requires passcode.`);
+            return res.status(401).json({
+                error: "Passcode required",
+                status: "requires_passcode",
+                previewName: item.name
+            });
+        }
+        // CASE C: PUBLIC (No code provided) -> Allow access
 
-        // CASE C: PUBLIC (or Restricted with Correct Code)
-        // Proceed to return the full invite
-        
-        // ... (Reconstruct payload logic remains the same) ...
+        // --- SUCCESS: RETURN PAYLOAD ---
         const invitePayload = {
             name: item.name,
             key: item.pubKey,
-            server: process.env.SERVER_URL || '', 
+            server: process.env.SERVER_URL || '',
             avatar: item.avatar || null,
             statusText: item.statusText || null,
             ecdhPubKey: item.ecdhPubKey || null,
@@ -483,12 +459,12 @@ app.get("/get-invite/:id", async (req, res) => {
             updateColor: item.updateColor || null,
             updateTimestamp: item.updateTimestamp || null
         };
-        
+
         // Remove nulls
         Object.keys(invitePayload).forEach(key => invitePayload[key] == null && delete invitePayload[key]);
         const reconstructedInviteCode = Buffer.from(JSON.stringify(invitePayload)).toString('base64');
 
-        console.log(`✅ SERVED: ${fullId} to ${searcherPubKey.slice(0,8)}...`);
+        console.log(`✅ SERVED: ${fullId} to ${searcherPubKey.slice(0, 8)}...`);
         res.json({ fullInviteCode: reconstructedInviteCode });
 
     } catch (err) {
@@ -496,7 +472,6 @@ app.get("/get-invite/:id", async (req, res) => {
         res.status(500).json({ error: "Database operation failed" });
     }
 });
-
 // Endpoint to find a user's current ID by their public key
 // Endpoint to find a user's current ID by their public key
 app.get("/get-id-by-pubkey/:pubkey", async (req, res) => {
