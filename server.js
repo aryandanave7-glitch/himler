@@ -139,7 +139,12 @@ async function connectToMongo() {
     // 3. Index for finding messages for a specific group (for cleanup, etc.)
     await groupOfflineMessagesCollection.createIndex({ groupID: 1 });
     // 4. TTL index for group messages (e.g., 14 days, same as 1-to-1)
+    // 4. TTL index for group messages (e.g., 14 days, same as 1-to-1)
     await groupOfflineMessagesCollection.createIndex({ "expireAt": 1 }, { expireAfterSeconds: 0 });
+    
+    // --- NEW: Array Index for efficient "Inbox" lookup ---
+    await groupOfflineMessagesCollection.createIndex({ pendingRecipients: 1 });
+    // -----------------------------------------------------
 
     console.log("✅ Groups collections and indexes are ready.");
     // --- END NEW: Setup for Groups ---
@@ -2218,101 +2223,145 @@ io.on("connection", (socket) => {
 
     // --- NEW: Group Chat Listeners (Phase 1) ---
 
+   // --- OPTIMIZED GROUP MESSAGE HANDLER (Single Blob Storage) ---
       socket.on("group_message", async ({ groupID, payload }) => {
           if (!groupID || !payload) return;
           const senderPubKey = socket.data.pubKey;
           if (!senderPubKey) return;
 
           try {
+              // 1. Fetch Group Metadata
               const group = await groupsCollection.findOne({ _id: new ObjectId(groupID) });
-              if (!group) {
-                  return log(`[group_message] Group ${groupID} not found.`);
+              if (!group) return console.log(`[Group] Group ${groupID} not found.`);
+              if (!group.members.includes(senderPubKey)) return console.log(`[Group] Sender not authorized.`);
+
+              // 2. Calculate Payload Size
+              const payloadSizeBytes = Buffer.byteLength(payload, 'utf8');
+              
+              // 3. Check Sender's Quota (Unified Check: DMs + Groups)
+              // We sum up the size of all messages where YOU are the sender
+              const [dmStats, groupStats] = await Promise.all([
+                  offlineMessagesCollection.aggregate([
+                      { $match: { senderPubKey: senderPubKey } },
+                      { $group: { _id: null, total: { $sum: "$sizeBytes" } } }
+                  ]).toArray(),
+                  groupOfflineMessagesCollection.aggregate([
+                      { $match: { senderPubKey: senderPubKey } },
+                      { $group: { _id: null, total: { $sum: "$sizeBytes" } } }
+                  ]).toArray()
+              ]);
+
+              const currentUsage = (dmStats[0]?.total || 0) + (groupStats[0]?.total || 0);
+              const USER_QUOTA = 50 * 1024 * 1024; // 50MB limit for total server footprint
+
+              if (currentUsage + payloadSizeBytes > USER_QUOTA) {
+                  // Ideally emit an error back to client, for now just log
+                  return console.log(`[Group] Quota exceeded for ${senderPubKey.slice(0,8)}...`);
               }
 
-              // Verify sender is a member
-              if (!group.members.includes(senderPubKey)) {
-                  return log(`[group_message] Sender ${senderPubKey.slice(0,10)} is not a member of group ${groupID}.`);
-              }
+              // 4. Determine Who is Offline
+              const onlineRecipients = [];
+              const offlineRecipients = [];
 
-              // Fan-out logic
               group.members.forEach(memberPubKey => {
-                  if (memberPubKey === senderPubKey) return; // Don't send back to sender
+                  if (memberPubKey === senderPubKey) return; // Don't send to self
 
-                  const targetSocketId = userSockets[memberPubKey];
-                  if (targetSocketId) {
-                      // --- User is ONLINE ---
-                      io.to(targetSocketId).emit("group_message_in", {
-                          groupID,
-                          payload,
-                          from: senderPubKey
-                      });
+                  if (userSockets[memberPubKey]) {
+                      onlineRecipients.push(memberPubKey);
                   } else {
-                      // --- User is OFFLINE ---
-                      // Store in the new offline collection for groups
-                      // We don't await this, let it run in the background
-                      groupOfflineMessagesCollection.insertOne({
-                          recipientPubKey: memberPubKey,
-                          groupID,
-                          from: senderPubKey,
-                          payload,
-                          createdAt: new Date(),
-                          expireAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) // 14-day TTL
-                      }).catch(err => console.error(`Failed to store offline group message: ${err}`));
+                      offlineRecipients.push(memberPubKey);
                   }
               });
+
+              // 5. Fan-out to ONLINE users (Instant)
+              onlineRecipients.forEach(memberPubKey => {
+                  const socketId = userSockets[memberPubKey];
+                  io.to(socketId).emit("group_message_in", {
+                      groupID,
+                      payload,
+                      from: senderPubKey
+                  });
+              });
+
+              // 6. Store ONCE for OFFLINE users (The Fix)
+              if (offlineRecipients.length > 0) {
+                  console.log(`[Group] Storing 1 copy for ${offlineRecipients.length} offline members.`);
+                  
+                  await groupOfflineMessagesCollection.insertOne({
+                      groupID,
+                      senderPubKey, // Used to charge quota to sender
+                      payload,      // The heavy encrypted blob
+                      sizeBytes: payloadSizeBytes,
+                      pendingRecipients: offlineRecipients, // Array of PubKeys
+                      createdAt: new Date(),
+                      expireAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) // 14 Days
+                  });
+              }
 
           } catch (err) {
               console.error(`Error processing group_message: ${err}`);
           }
       });
-
+      // --- OPTIMIZED FETCH (Array Lookup) ---
       socket.on("check-for-group-offline-messages", async () => {
           const key = socket.data.pubKey;
-          if (!key) return; // Client not registered
+          if (!key) return; 
 
           try {
-              const messages = await groupOfflineMessagesCollection.find({ recipientPubKey: key }).toArray();
+              // Find messages where 'key' exists inside the 'pendingRecipients' array
+              const messages = await groupOfflineMessagesCollection.find({ 
+                  pendingRecipients: key 
+              }).toArray();
+
               if (messages.length > 0) {
-                  log(`📬 Client ${key.slice(0,10)}... is pulling ${messages.length} GROUP messages.`);
+                  console.log(`[Group] Sending ${messages.length} offline messages to ${key.slice(0,8)}...`);
                   messages.forEach(msg => {
                       socket.emit("group_message_in", {
-                          id: msg._id.toString(), // Add ID for deletion
+                          id: msg._id.toString(), // Critical for deletion later
                           groupID: msg.groupID,
-                          from: msg.from,
+                          from: msg.senderPubKey,
                           payload: msg.payload,
                           sentAt: msg.createdAt
                       });
                   });
-              } else {
-                   log(`📬 Client ${key.slice(0,10)}... pulled GROUP messages, 0 found.`);
               }
           } catch (err) {
-              console.error(`Error fetching offline GROUP messages for ${key.slice(0,10)}:`, err);
+              console.error(`Error fetching offline group messages:`, err);
           }
       });
 
+      // --- OPTIMIZED CLEANUP (Remove Tag -> Delete Blob) ---
       socket.on("group-message-delivered", async (data) => {
           if (!data || !data.id) return;
-          if (!socket.data.pubKey) return; // Client not registered
+          const recipientKey = socket.data.pubKey;
+          if (!recipientKey) return;
 
           try {
               const _id = new ObjectId(data.id);
-              // Check that the client confirming is the recipient
-              const deleteResult = await groupOfflineMessagesCollection.deleteOne({
-                  _id: _id,
-                  recipientPubKey: socket.data.pubKey 
-              });
 
-              if (deleteResult.deletedCount === 1) {
-                  log(`✅ Group Message ${data.id} delivered to ${socket.data.pubKey.slice(0,10)}... and deleted.`);
-              } else {
-                  log(`⚠️ Group Message ${data.id} delivery confirmation failed (not found, or wrong recipient).`);
+              // 1. Remove THIS user from the pending list
+              const updateResult = await groupOfflineMessagesCollection.updateOne(
+                  { _id: _id },
+                  { $pull: { pendingRecipients: recipientKey } }
+              );
+
+              if (updateResult.modifiedCount > 0) {
+                  // 2. Check if the list is now empty
+                  const doc = await groupOfflineMessagesCollection.findOne({ _id: _id });
+                  
+                  // If doc exists AND recipients array is empty...
+                  if (doc && doc.pendingRecipients.length === 0) {
+                      // ...Delete the blob!
+                      await groupOfflineMessagesCollection.deleteOne({ _id: _id });
+                      console.log(`[Group] Message ${data.id} fully delivered to all. Blob deleted.`);
+                  } else {
+                      console.log(`[Group] Message ${data.id} confirmed by ${recipientKey.slice(0,8)}... (${doc ? doc.pendingRecipients.length : '?'} remaining)`);
+                  }
               }
           } catch (err) {
-               console.error(`Error deleting delivered group message ${data.id}:`, err);
+               console.error(`Error handling group message delivery:`, err);
           }
       });
-
       // --- END: Group Chat Listeners (Phase 1) ---
   
   // Handle presence subscription
