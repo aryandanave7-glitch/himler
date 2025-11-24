@@ -260,23 +260,20 @@ app.use(cors());       // CORS Middleware
 // Endpoint to claim a new Syrja ID
 // Endpoint to claim a new Syrja ID (MODIFIED for MongoDB)
 app.post("/claim-id", async (req, res) => {
-    // --- NEW: Accept 'regenerate' flag ---
     const { customId, fullInviteCode, persistence, privacy, pubKey, regenerate } = req.body; 
 
     if (!customId || !fullInviteCode || !persistence || !privacy || !pubKey) {
         return res.status(400).json({ error: "Missing required fields" });
     }
 
-    // --- SECURITY FIX: Validate ID Format (No @ allowed) ---
+    // --- SECURITY: ID Validation ---
     const idPart = customId.replace('syrja/', '');
-    // Allow A-Z, 0-9, underscore, dash. BLOCK everything else.
     if (!/^[a-zA-Z0-9_-]+$/.test(idPart)) {
-        return res.status(400).json({ error: "ID contains invalid characters. Use only letters, numbers, - or _." });
+        return res.status(400).json({ error: "ID contains invalid characters." });
     }
-    // ------------------------------------------------------
 
     try {
-        // Check ownership... (Keep existing ownership checks)
+        // 1. Ownership Checks
         const existingUserEntry = await idsCollection.findOne({ pubKey: pubKey });
         if (existingUserEntry && existingUserEntry._id !== customId) {
             return res.status(409).json({ error: "You already own a different ID." });
@@ -286,97 +283,84 @@ app.post("/claim-id", async (req, res) => {
             return res.status(409).json({ error: "ID already taken" });
         }
 
-        // Decode Profile... (Keep existing decode logic)
-        let decodedProfile;
-        let statusText = null; 
-        let updateText = null;
-        let updateColor = null;
-        let ecdhPubKey = null;
-
-        try {
-            decodedProfile = JSON.parse(Buffer.from(fullInviteCode, 'base64').toString('utf8'));
-            statusText = decodedProfile.statusText || null;
-            updateText = decodedProfile.updateText || null;
-            updateColor = decodedProfile.updateColor || null;
-            ecdhPubKey = decodedProfile.ecdhPubKey || null;
-        } catch (e) {}
-
-        // --- NEW LOGIC: Determine Passcode ---
+        // 2. Passcode Logic
         let verificationPasscode;
-        
         if (regenerate) {
-            // Force new code if requested
             verificationPasscode = generatePasscode();
         } else if (existingIdEntry && existingIdEntry.verificationPasscode) {
-            // Keep existing if available
             verificationPasscode = existingIdEntry.verificationPasscode;
         } else {
-            // Generate new if missing
             verificationPasscode = generatePasscode();
         }
-        // -------------------------------------
 
-        const syrjaDoc = {
-            _id: customId,
-            code: fullInviteCode,
-            pubKey: pubKey,
-            permanent: persistence === 'permanent',
-            privacy: privacy,
-            
-            // --- NEW: Save Passcode ---
-            verificationPasscode: verificationPasscode,
-            // --------------------------
-            
-            updatedAt: new Date(),
-            name: decodedProfile?.name || null,
-            avatar: decodedProfile?.avatar || null,
-            statusText: statusText,
-            ecdhPubKey: ecdhPubKey,
-            updateText: updateText,
-            updateColor: updateColor,
-            updateTimestamp: updateText ? new Date() : null 
+        // 3. Prepare the Update Object ($set)
+        // We ONLY set fields we want to change. We do NOT wipe the doc.
+        const updateDoc = {
+            $set: {
+                code: fullInviteCode,
+                pubKey: pubKey,
+                permanent: (persistence === 'permanent'),
+                privacy: privacy,
+                verificationPasscode: verificationPasscode,
+                updatedAt: new Date(),
+            }
         };
 
-        if (persistence === 'temporary') {
-            syrjaDoc.expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
-        }
-
-        await idsCollection.replaceOne({ _id: customId }, syrjaDoc, { upsert: true });
-
-        if (persistence === 'permanent') {
-             await idsCollection.updateOne({ _id: customId }, { $unset: { expireAt: "" } });
-        }
-
-        console.log(`✅ ID Claimed/Updated: ${customId} (Privacy: ${privacy})`);
-
-        // --- NEW: REAL-TIME NOTIFICATION ---
-        // 1. Normalize the key to match the subscription map
-        const cleanKey = pubKey.replace(/\s+/g, '');
-        
-        // 2. Find everyone watching this user (Friends who are online)
-        const subscribers = presenceSubscriptions[cleanKey];
-        
-        if (subscribers && subscribers.length > 0) {
-            console.log(`📢 Pushing profile update to ${subscribers.length} subscribers...`);
+        // 4. Optional: Extract Metadata for Indexing (Safe Parsing)
+        // Even if encrypted, we might want to try extracting public metadata if available
+        try {
+            const decoded = JSON.parse(Buffer.from(fullInviteCode, 'base64').toString('utf8'));
             
-            // 3. Blast the new data to them
+            // Only save these if they exist (don't overwrite with null if not present)
+            if(decoded.name) updateDoc.$set.name = decoded.name;
+            if(decoded.avatar) updateDoc.$set.avatar = decoded.avatar;
+            if(decoded.statusText) updateDoc.$set.statusText = decoded.statusText;
+            if(decoded.ecdhPubKey) updateDoc.$set.ecdhPubKey = decoded.ecdhPubKey;
+            
+            // For updates/stories
+            if(decoded.updateText) updateDoc.$set.updateText = decoded.updateText;
+            if(decoded.updateColor) updateDoc.$set.updateColor = decoded.updateColor;
+            if(decoded.updateText) updateDoc.$set.updateTimestamp = new Date();
+
+        } catch (e) {
+            console.warn(`[Server] Failed to parse metadata for ${customId}. Saving blob only.`);
+        }
+
+        // 5. Handle TTL (Temporary IDs)
+        if (persistence === 'temporary') {
+            updateDoc.$set.expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        } else {
+            updateDoc.$unset = { expireAt: "" }; // Remove expiry for permanent
+        }
+
+        // 6. Perform the Update (Upsert=True creates it if missing)
+        await idsCollection.updateOne(
+            { _id: customId },
+            updateDoc,
+            { upsert: true }
+        );
+
+        console.log(`✅ ID Claimed/Updated: ${customId}`);
+
+        // 7. Real-Time Push (Presence)
+        const cleanKey = pubKey.replace(/\s+/g, '');
+        const subscribers = presenceSubscriptions[cleanKey];
+        if (subscribers && subscribers.length > 0) {
             subscribers.forEach(socketId => {
                 io.to(socketId).emit('contact-profile-updated', {
                     pubKey: pubKey,
-                    fullInviteCode: fullInviteCode // Send the new data directly!
+                    fullInviteCode: fullInviteCode
                 });
             });
         }
-        // --- END NEW ---
-        
-        // --- NEW: Return the code to the client ---
+
         res.json({ success: true, id: customId, verificationPasscode: verificationPasscode });
+
     } catch (err) {
         console.error("claim-id error:", err);
         res.status(500).json({ error: "Database operation failed" });
     }
 });
-
 // Endpoint to get an invite code from a Syrja ID (for adding contacts)
 // Endpoint to get an invite code from a Syrja ID (MODIFIED for MongoDB)
 // Endpoint to get an invite code from a Syrja ID (MODIFIED for MongoDB + Block Check)
