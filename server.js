@@ -308,24 +308,36 @@ app.post("/claim-id", async (req, res) => {
 
         // 4. Optional: Extract Metadata for Indexing (Safe Parsing)
         // Even if encrypted, we might want to try extracting public metadata if available
+        // 4. Optional: Extract Metadata for Indexing (Safe Parsing)
         try {
             const decoded = JSON.parse(Buffer.from(fullInviteCode, 'base64').toString('utf8'));
             
-            // Only save these if they exist (don't overwrite with null if not present)
+            // Only save these if they exist
             if(decoded.name) updateDoc.$set.name = decoded.name;
             if(decoded.avatar) updateDoc.$set.avatar = decoded.avatar;
             if(decoded.statusText) updateDoc.$set.statusText = decoded.statusText;
             if(decoded.ecdhPubKey) updateDoc.$set.ecdhPubKey = decoded.ecdhPubKey;
             
-            // For updates/stories
-            if(decoded.updateText) updateDoc.$set.updateText = decoded.updateText;
-            if(decoded.updateColor) updateDoc.$set.updateColor = decoded.updateColor;
-            if(decoded.updateText) updateDoc.$set.updateTimestamp = new Date();
+            // --- FIX: Capture the Update/Story Data ---
+            // The client sends these fields inside the inviteData object
+            if(decoded.updateText !== undefined) { 
+                updateDoc.$set.updateText = decoded.updateText; 
+            }
+            if(decoded.updateColor !== undefined) { 
+                updateDoc.$set.updateColor = decoded.updateColor; 
+            }
+            // Always set a timestamp if there is text, otherwise nullify it
+            if(decoded.updateText) {
+                updateDoc.$set.updateTimestamp = new Date();
+            } else {
+                // If text is empty string, it means "delete update"
+                updateDoc.$set.updateTimestamp = null;
+            }
+            // -------------------------------------------
 
         } catch (e) {
             console.warn(`[Server] Failed to parse metadata for ${customId}. Saving blob only.`);
         }
-
         // 5. Handle TTL (Temporary IDs)
         if (persistence === 'temporary') {
             updateDoc.$set.expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
