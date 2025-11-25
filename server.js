@@ -379,6 +379,50 @@ app.post("/claim-id", async (req, res) => {
         res.status(500).json({ error: "Database operation failed" });
     }
 });
+
+// --- PHASE 1: PreKey Fetching Endpoint ---
+app.post("/fetch-prekey-bundle", async (req, res) => {
+    const { recipientPubKey } = req.body;
+    
+    if (!recipientPubKey) return res.status(400).json({ error: "Missing recipientPubKey" });
+
+    try {
+        // 1. Find the recipient
+        const user = await idsCollection.findOne({ pubKey: recipientPubKey });
+        if (!user) return res.status(404).json({ error: "User not found" });
+
+        if (!user.signedPreKey) {
+            return res.status(404).json({ error: "User has not set up Signal-security yet." });
+        }
+
+        // 2. Get one One-Time Key (if available)
+        let oneTimeKey = null;
+        if (user.oneTimeKeys && user.oneTimeKeys.length > 0) {
+            // Take the first one
+            oneTimeKey = user.oneTimeKeys[0];
+            
+            // 3. CRITICAL: Delete it from DB so it's never reused (Forward Secrecy)
+            await idsCollection.updateOne(
+                { _id: user._id },
+                { $pull: { oneTimeKeys: { id: oneTimeKey.id } } }
+            );
+            console.log(`[Server] Served & burned One-Time Key #${oneTimeKey.id} for ${user.name}`);
+        } else {
+            console.log(`[Server] Warning: ${user.name} is out of One-Time Keys. Falling back to Signed PreKey only.`);
+        }
+
+        // 4. Return the Bundle
+        res.json({
+            identityKey: user.ecdhPubKey, // Their long-term encryption key
+            signedPreKey: user.signedPreKey,
+            oneTimeKey: oneTimeKey // Might be null, which is allowed in X3DH
+        });
+
+    } catch (err) {
+        console.error("Fetch PreKey error:", err);
+        res.status(500).json({ error: "Database error fetching keys" });
+    }
+});
 // Endpoint to get an invite code from a Syrja ID (for adding contacts)
 // Endpoint to get an invite code from a Syrja ID (MODIFIED for MongoDB)
 // Endpoint to get an invite code from a Syrja ID (MODIFIED for MongoDB + Block Check)
