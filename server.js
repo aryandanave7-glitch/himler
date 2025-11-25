@@ -317,6 +317,12 @@ app.post("/claim-id", async (req, res) => {
             if(decoded.avatar) updateDoc.$set.avatar = decoded.avatar;
             if(decoded.statusText) updateDoc.$set.statusText = decoded.statusText;
             if(decoded.ecdhPubKey) updateDoc.$set.ecdhPubKey = decoded.ecdhPubKey;
+            if(decoded.preKeyBundle) {
+                updateDoc.$set.signedPreKey = decoded.preKeyBundle.signedPreKey;
+                // We overwrite the oneTimeKeys array to keep it fresh
+                updateDoc.$set.oneTimeKeys = decoded.preKeyBundle.oneTimeKeys;
+                console.log(`[Server] Stored PreKey Bundle for ${customId} (Keys: ${decoded.preKeyBundle.oneTimeKeys.length})`);
+            }
             
             // --- FIX: Capture the Update/Story Data ---
             // The client sends these fields inside the inviteData object
