@@ -2520,36 +2520,42 @@ io.on("connection", (socket) => {
   });
 
   // server.js - New Code
-// -- Video/Voice Call Signaling --
+// -- Video/Voice Call Signaling (VERBOSE LOGGING) --
 socket.on("call-request", ({ to, from, callType }) => {
     const targetId = userSockets[normKey(to)];
+    console.log(`[SIGNAL] 'call-request' received from ${from.slice(0,8)}... for ${to.slice(0,8)}... (Socket: ${targetId || 'OFFLINE'})`);
     if (targetId) {
         io.to(targetId).emit("incoming-call", { from: normKey(from), callType });
-        console.log(`📞 Call request (${callType}): ${from.slice(0,12)}... → ${to.slice(0,12)}...`);
+        console.log(`   -> Relayed 'incoming-call' to socket ${targetId}`);
+    } else {
+        console.warn(`   -> FAILED: Target ${to.slice(0,8)}... is offline or not registered.`);
     }
 });
 
 socket.on("call-accepted", ({ to, from }) => {
     const targetId = userSockets[normKey(to)];
+    console.log(`[SIGNAL] 'call-accepted' received from ${from.slice(0,8)}... for ${to.slice(0,8)}... (Socket: ${targetId || 'OFFLINE'})`);
     if (targetId) {
         io.to(targetId).emit("call-accepted", { from: normKey(from) });
-        console.log(`✔️ Call accepted: ${from.slice(0,12)}... → ${to.slice(0,12)}...`);
+        console.log(`   -> Relayed 'call-accepted' to socket ${targetId}`);
     }
 });
 
 socket.on("call-rejected", ({ to, from }) => {
     const targetId = userSockets[normKey(to)];
+    console.log(`[SIGNAL] 'call-rejected' received from ${from.slice(0,8)}... for ${to.slice(0,8)}...`);
     if (targetId) {
         io.to(targetId).emit("call-rejected", { from: normKey(from) });
-        console.log(`❌ Call rejected: ${from.slice(0,12)}... → ${to.slice(0,12)}...`);
+        console.log(`   -> Relayed 'call-rejected' to socket ${targetId}`);
     }
 });
 
 socket.on("call-ended", ({ to, from }) => {
     const targetId = userSockets[normKey(to)];
+    console.log(`[SIGNAL] 'call-ended' received from ${from.slice(0,8)}... for ${to.slice(0,8)}...`);
     if (targetId) {
         io.to(targetId).emit("call-ended", { from: normKey(from) });
-        console.log(`👋 Call ended: ${from.slice(0,12)}... & ${to.slice(0,12)}...`);
+        console.log(`   -> Relayed 'call-ended' to socket ${targetId}`);
     }
 });
 // ---------------------------------
